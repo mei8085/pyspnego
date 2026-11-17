@@ -19,7 +19,7 @@ from spnego.exceptions import (
     OperationNotAvailableError,
     SpnegoError,
 )
-from spnego.tls import default_tls_context
+from spnego.tls import default_tls_context, generate_tls_certificate
 
 
 @pytest.mark.parametrize(
@@ -317,3 +317,249 @@ def test_credssp_no_credential(ntlm_cred):
 
     with pytest.raises(InvalidTokenError, match="No credential received on CredSSP TSRequest from initiator"):
         s.step(c.wrap(request.pack()).data)
+
+
+def _tamper_ts_request_version(
+    token: bytes,
+    reader: credssp.CredSSPProxy,
+    writer: credssp.CredSSPProxy,
+    version: int,
+) -> bytes:
+    """Rewrites the version field of a TLS wrapped TSRequest.
+
+    This simulates a man in the middle that has terminated the TLS channel and
+    tampers with the CredSSP protocol version to force a downgrade, e.g. to
+    bring back the CVE-2018-0886 susceptible protocol versions. The token is
+    unwrapped with the reader (the intended recipient), modified, and wrapped
+    again with the writer (the apparent sender) so the tampered token is still
+    valid TLS data for the recipient.
+    """
+    ts_request = TSRequest.unpack(reader.unwrap(token).data)
+    downgraded = TSRequest(
+        version,
+        nego_tokens=ts_request.nego_tokens,
+        auth_info=ts_request.auth_info,
+        pub_key_auth=ts_request.pub_key_auth,
+        error_code=ts_request.error_code,
+        client_nonce=ts_request.client_nonce,
+    )
+
+    return writer.wrap(downgraded.pack()).data
+
+
+@pytest.mark.parametrize(
+    "c_version, s_version",
+    [(6, 6), (6, 5), (5, 6), (6, 2), (2, 6), (5, 5), (3, 4), (2, 2)],
+)
+def test_credssp_version_negotiation_pub_key_binding(c_version, s_version, ntlm_cred, monkeypatch):
+    """Pub key binding holds across all negotiated version combinations.
+
+    Whatever version the peers negotiate down to, the public key authentication
+    is still verified and a successful exchange must mean both the inner
+    authentication and the outer TLS key binding succeeded.
+    """
+    monkeypatch.setattr(credssp, "_CREDSSP_VERSION", 6)
+
+    c = credssp.CredSSPProxy(ntlm_cred[0], ntlm_cred[1], hostname=socket.gethostname(), protocol="credssp")
+    s = credssp.CredSSPProxy(None, None, hostname=socket.gethostname(), protocol="credssp", usage="accept")
+
+    def step(proxy: credssp.CredSSPProxy, version: int, token: bytes) -> bytes:
+        # _CREDSSP_VERSION is a module global so it is toggled around each step
+        # to simulate peers with different maximum protocol versions.
+        credssp._CREDSSP_VERSION = version
+        return proxy.step(token)
+
+    token = step(c, c_version, None)
+    while True:
+        token = step(s, s_version, token)
+        if c.complete and s.complete:
+            break
+
+        token = step(c, c_version, token)
+
+    expected_version = min(c_version, s_version)
+    assert c.get_extra_info("protocol_version") == expected_version
+    assert s.get_extra_info("protocol_version") == expected_version
+
+    # The delegated credential only arrives if the inner authentication and the
+    # public key binding both succeeded.
+    credential = s.get_extra_info("client_credential")
+    assert credential is not None
+    assert credential.password == ntlm_cred[1]
+
+
+def test_credssp_version_downgrade_mitm_completes_at_lower_version(ntlm_cred):
+    """A version downgrade is not misreported as a stronger protocol.
+
+    With the default minimum protocol of 2 a MITM can downgrade the exchange to
+    version 2 and the authentication still completes (backwards compatibility).
+    The negotiated version must be observable as 2 on both peers so the weaker
+    security posture is not misjudged as a fully mitigated exchange.
+    """
+    c = credssp.CredSSPProxy(ntlm_cred[0], ntlm_cred[1], hostname=socket.gethostname(), protocol="credssp")
+    s = credssp.CredSSPProxy(None, None, hostname=socket.gethostname(), protocol="credssp", usage="accept")
+
+    # Run the TLS handshake but keep back the client's first TSRequest so the
+    # MITM can tamper with it before the server processes it.
+    server_tls_token = None
+    client_tls_token = None
+    while c._auth_context is None:
+        client_tls_token = c.step(server_tls_token)
+        if c._auth_context is not None:
+            break
+
+        server_tls_token = s.step(client_tls_token)
+
+    # Relay the TSRequests, downgrading the version field in both directions
+    # like a MITM forcing the CVE-2018-0886 susceptible protocol.
+    assert client_tls_token is not None
+    out_token = _tamper_ts_request_version(client_tls_token, s, c, 2)
+    in_token = s.step(out_token)
+    while True:
+        in_token = _tamper_ts_request_version(in_token, c, s, 2)
+        out_token = c.step(in_token)
+        if c.complete and s.complete:
+            break
+
+        out_token = _tamper_ts_request_version(out_token, s, c, 2)
+        in_token = s.step(out_token)
+        if s.complete:
+            break
+
+    assert c.complete
+    assert s.complete
+    assert c.get_extra_info("protocol_version") == 2
+    assert s.get_extra_info("protocol_version") == 2
+
+
+def test_credssp_version_downgrade_mitm_client_rejects(ntlm_cred):
+    """A client with a minimum protocol must reject a downgraded exchange."""
+    c = credssp.CredSSPProxy(
+        ntlm_cred[0],
+        ntlm_cred[1],
+        hostname=socket.gethostname(),
+        protocol="credssp",
+        credssp_min_protocol=5,
+    )
+    s = credssp.CredSSPProxy(None, None, hostname=socket.gethostname(), protocol="credssp", usage="accept")
+
+    server_tls_token = None
+    while c._auth_context is None:
+        client_tls_token = c.step(server_tls_token)
+        server_tls_token = s.step(client_tls_token)
+
+    # The MITM rewrites the server response to version 2, the client must not
+    # continue with the weaker protocol.
+    downgraded = _tamper_ts_request_version(server_tls_token, c, s, 2)
+
+    expected = "did not meet the minimum requirements"
+    with pytest.raises(InvalidTokenError, match=expected):
+        c.step(downgraded)
+
+    assert not c.complete
+
+
+def test_credssp_version_downgrade_mitm_server_rejects(ntlm_cred):
+    """A server with a minimum protocol must reject a downgraded exchange."""
+    c = credssp.CredSSPProxy(ntlm_cred[0], ntlm_cred[1], hostname=socket.gethostname(), protocol="credssp")
+    s = credssp.CredSSPProxy(
+        None,
+        None,
+        hostname=socket.gethostname(),
+        protocol="credssp",
+        usage="accept",
+        credssp_min_protocol=5,
+    )
+
+    # Run the TLS handshake but keep back the client's first TSRequest so the
+    # MITM can tamper with it before the server processes it.
+    server_tls_token = None
+    client_tls_token = None
+    while c._auth_context is None:
+        client_tls_token = c.step(server_tls_token)
+        if c._auth_context is not None:
+            break
+
+        server_tls_token = s.step(client_tls_token)
+
+    assert client_tls_token is not None
+    ts_request = TSRequest.unpack(s.unwrap(client_tls_token).data)
+    assert ts_request.version == 6
+
+    forged = c.wrap(TSRequest(2, nego_tokens=ts_request.nego_tokens).pack()).data
+
+    expected = "did not meet the minimum requirements"
+    with pytest.raises(InvalidTokenError, match=expected):
+        s.step(forged)
+
+    assert not s.complete
+
+
+@pytest.mark.parametrize("version", [2, 5, 6])
+def test_credssp_mitm_tls_public_key_mismatch_rejected(version, ntlm_cred, monkeypatch):
+    """Inner auth success cannot compensate for a wrong outer TLS public key.
+
+    Simulates a MITM that terminates TLS with its own certificate: the client
+    binds the authentication to the key it saw while the server holds a
+    different key. Even though the inner NTLM authentication succeeds the
+    exchange must be rejected at every protocol version, including the
+    downgraded ones.
+    """
+    monkeypatch.setattr(credssp, "_CREDSSP_VERSION", version)
+
+    c = credssp.CredSSPProxy(ntlm_cred[0], ntlm_cred[1], hostname=socket.gethostname(), protocol="credssp")
+    s = credssp.CredSSPProxy(None, None, hostname=socket.gethostname(), protocol="credssp", usage="accept")
+
+    # The server ends up holding a different public key than the one the client
+    # saw in the TLS handshake, as if a MITM presented its own certificate.
+    s._tls_context.public_key = generate_tls_certificate()[2]
+
+    def exchange() -> None:
+        token = c.step()
+        for _ in range(20):
+            token = s.step(token)
+            token = c.step(token)
+
+        raise AssertionError("CredSSP exchange did not fail as expected")
+
+    expected = "Public key verification failed, potential man in the middle attack"
+    with pytest.raises(BadBindingsError, match=expected):
+        exchange()
+
+    # The inner authentication succeeded but the missing outer key binding
+    # keeps the exchange rejected and no credential is delegated.
+    assert s._auth_context is not None
+    assert s._auth_context.complete
+    assert not s.complete
+    assert s.get_extra_info("client_credential") is None
+
+
+def test_credssp_inner_auth_failure_not_masked_by_tls(ntlm_cred):
+    """A valid TLS channel and public key cannot rescue failed inner auth.
+
+    The inverse of the public key binding checks: the outer TLS key matches but
+    the inner authentication (wrong password) fails. The failure must surface
+    and neither peer may report a completed context.
+    """
+    c = credssp.CredSSPProxy(ntlm_cred[0], "invalid password", hostname=socket.gethostname(), protocol="credssp")
+    s = credssp.CredSSPProxy(None, None, hostname=socket.gethostname(), protocol="credssp", usage="accept")
+
+    def exchange() -> None:
+        token = c.step()
+        for _ in range(20):
+            token = s.step(token)
+            if token is None:
+                # CredSSP v2/5 style failure, the server just stops responding.
+                return
+
+            token = c.step(token)
+
+        raise AssertionError("CredSSP exchange did not fail as expected")
+
+    expected = "Received NTStatus in TSRequest from acceptor"
+    with pytest.raises(SpnegoError, match=expected):
+        exchange()
+
+    assert not c.complete
+    assert not s.complete
+    assert s.get_extra_info("client_credential") is None
