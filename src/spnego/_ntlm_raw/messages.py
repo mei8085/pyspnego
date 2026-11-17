@@ -228,7 +228,14 @@ class _NTLMMessageMeta(type):
         **kwargs: typing.Any,
     ) -> "_NTLMMessageMeta":
         if "_b_data" in kwargs:
-            message_type = struct.unpack("<I", kwargs["_b_data"][8:12])[0]
+            b_data = kwargs["_b_data"]
+            if len(b_data) < 12:
+                raise ValueError("Invalid NTLM message raw byte length")
+
+            message_type = struct.unpack("<I", b_data[8:12])[0]
+            if message_type not in cls.__registry:
+                raise ValueError("Unknown NTLM MessageType %d" % message_type)
+
             new_cls = cls.__registry[message_type]
 
         else:
@@ -789,11 +796,17 @@ class FileTime(datetime.datetime):
     @staticmethod
     def unpack(b_data: bytes) -> "FileTime":
         """Unpacks the structure from bytes."""
+        if len(b_data) != 8:
+            raise ValueError("FileTime bytes must have a length of 8")
+
         filetime = struct.unpack("<Q", b_data)[0]  # 100 nanosecond intervals since 1601-01-01.
 
         # Create a datetime object based on the filetime microseconds
         epoch_time_ms = (filetime - FileTime._EPOCH_FILETIME) // 10
-        dt = datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=epoch_time_ms)
+        try:
+            dt = datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=epoch_time_ms)
+        except OverflowError as e:
+            raise ValueError("FILETIME value %d is out of the supported range" % filetime) from e
 
         # Create the FileTime object from the datetime object and add the nanoseconds.
         ns = int(filetime % 10) * 100
@@ -959,12 +972,25 @@ class TargetInfo(collections.OrderedDict):
         target_info = TargetInfo()
         b_io = io.BytesIO(b_data)
 
-        b_av_id = b_io.read(2)
+        while True:
+            b_av_id = b_io.read(2)
+            if not b_av_id:
+                break
 
-        while b_av_id:
+            if len(b_av_id) != 2:
+                raise ValueError("TargetInfo AV_PAIR has a truncated AvId")
+
             av_id = struct.unpack("<H", b_av_id)[0]
-            length = struct.unpack("<H", b_io.read(2))[0]
-            b_value = b_io.read(length)
+
+            b_av_len = b_io.read(2)
+            if len(b_av_len) != 2:
+                raise ValueError("TargetInfo AV_PAIR has a truncated AvLen")
+
+            av_len = struct.unpack("<H", b_av_len)[0]
+
+            b_value = b_io.read(av_len)
+            if len(b_value) != av_len:
+                raise ValueError("TargetInfo AV_PAIR has a truncated Value")
 
             value: typing.Any
             if av_id in TargetInfo._FIELD_TYPES["text"]:
@@ -972,6 +998,9 @@ class TargetInfo(collections.OrderedDict):
                 value = b_value.decode("utf-16-le")
 
             elif av_id in TargetInfo._FIELD_TYPES["int32"]:
+                if av_len != 4:
+                    raise ValueError("TargetInfo AV_PAIR MsvAvFlags must be 4 bytes long")
+
                 value = AvFlags(struct.unpack("<I", b_value)[0])
 
             elif av_id == AvId.timestamp:
@@ -984,7 +1013,6 @@ class TargetInfo(collections.OrderedDict):
                 value = b_value
 
             target_info[AvId(av_id)] = value
-            b_av_id = b_io.read(2)
 
         return target_info
 

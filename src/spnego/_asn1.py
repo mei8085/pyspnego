@@ -426,6 +426,9 @@ def unpack_asn1(b_data: bytes) -> typing.Tuple[ASN1Value, bytes]:
         ASN1Value: The ASN.1 value that is unpacked from the raw bytes passed in.
         bytes: Any remaining bytes that are not part of the ASN1Value.
     """
+    if len(b_data) < 2:
+        raise ValueError("ASN.1 TLV must contain at least an identifier and length octet")
+
     octet1 = struct.unpack("B", b_data[:1])[0]
     tag_class = TagClass((octet1 & 0b11000000) >> 6)
     constructed = bool(octet1 & 0b00100000)
@@ -441,6 +444,9 @@ def unpack_asn1(b_data: bytes) -> typing.Tuple[ASN1Value, bytes]:
 
     b_data = b_data[length_offset:]
 
+    if not b_data:
+        raise ValueError("ASN.1 TLV is missing the length octet")
+
     length = struct.unpack("B", b_data[:1])[0]
     length_octets = 1
 
@@ -448,6 +454,9 @@ def unpack_asn1(b_data: bytes) -> typing.Tuple[ASN1Value, bytes]:
         # If the MSB is set then the length octet just contains the number of octets that encodes the actual length.
         length_octets += length & 0b01111111
         length = 0
+
+        if len(b_data) < length_octets:
+            raise ValueError("ASN.1 TLV long form length octets are truncated")
 
         for idx in range(1, length_octets):
             octet_val = struct.unpack("B", b_data[idx : idx + 1])[0]
@@ -467,9 +476,16 @@ def unpack_asn1_bit_string(value: typing.Union[ASN1Value, bytes]) -> bytes:
     """Unpacks an ASN.1 BIT STRING value."""
     b_data = extract_asn1_tlv(value, TagClass.universal, TypeTagNumber.bit_string)
 
+    if not b_data:
+        raise ValueError("ASN.1 BIT STRING must contain at least the unused bits octet")
+
+    if len(b_data) == 1:
+        # Just the unused bits octet, there are no bit octets to return.
+        return b""
+
     # First octet is the number of unused bits in the last octet from the LSB.
     unused_bits = struct.unpack("B", b_data[:1])[0]
-    last_octet = struct.unpack("B", b_data[-2:-1])[0]
+    last_octet = struct.unpack("B", b_data[-1:])[0]
     last_octet = (last_octet >> unused_bits) << unused_bits
 
     return b_data[1:-1] + struct.pack("B", last_octet)
@@ -520,6 +536,9 @@ def unpack_asn1_integer(value: typing.Union[ASN1Value, bytes]) -> int:
     """Unpacks an ASN.1 INTEGER value."""
     b_int = bytearray(extract_asn1_tlv(value, TagClass.universal, TypeTagNumber.integer))
 
+    if not b_int:
+        raise ValueError("ASN.1 INTEGER must contain at least 1 octet")
+
     is_negative = b_int[0] & 0b10000000
     if is_negative:
         # Get the two's compliment.
@@ -549,6 +568,9 @@ def unpack_asn1_integer(value: typing.Union[ASN1Value, bytes]) -> int:
 def unpack_asn1_object_identifier(value: typing.Union[ASN1Value, bytes]) -> str:
     """Unpacks an ASN.1 OBJECT IDENTIFIER value."""
     b_data = extract_asn1_tlv(value, TagClass.universal, TypeTagNumber.object_identifier)
+
+    if not b_data:
+        raise ValueError("ASN.1 OBJECT IDENTIFIER must contain at least 1 octet")
 
     first_element = struct.unpack("B", b_data[:1])[0]
     second_element = first_element % 40
@@ -590,6 +612,9 @@ def _unpack_asn1_octet_number(b_data: bytes) -> typing.Tuple[int, int]:
     i = 0
     idx = 0
     while True:
+        if idx >= len(b_data):
+            raise ValueError("ASN.1 multi-octet number is truncated")
+
         element = struct.unpack("B", b_data[idx : idx + 1])[0]
         idx += 1
 

@@ -195,7 +195,7 @@ def test_pack_neg_token_init():
 
     token = sp.unpack_token(actual)
     assert token.mech_types == ["1.2.840.113554.1.2.2", "1.3.6.1.4.1.311.2.2.10"]
-    assert token.req_flags == sp.ContextFlags.deleg
+    assert token.req_flags == sp.ContextFlags.anon
     assert token.mech_token == b"\x00\x00\x00\x00"
     assert token.hint_name is None
     assert token.hint_address is None
@@ -227,7 +227,7 @@ def test_pack_neg_token_init2():
 
     token = sp.unpack_token(actual)
     assert token.mech_types == ["1.2.840.113554.1.2.2", "1.3.6.1.4.1.311.2.2.10"]
-    assert token.req_flags == sp.ContextFlags.deleg
+    assert token.req_flags == sp.ContextFlags.anon
     assert token.mech_token == b"\x00\x00\x00\x00"
     assert token.hint_name == b"spn"
     assert token.hint_address == b"not_defined_in_RFC4178@please_ignore"

@@ -5,6 +5,7 @@ import base64
 import logging
 import os
 import socket
+import struct
 import typing
 
 from spnego._context import (
@@ -381,10 +382,15 @@ class NTLMProxy(ContextProxy):
         if not self._is_wrapped:
             log.debug("NTLM step input: %s", base64.b64encode(in_token or b"").decode())
 
-        out_token = getattr(self, "_step_%s" % self.usage)(
-            in_token=in_token,
-            channel_bindings=channel_bindings,
-        )
+        try:
+            out_token = getattr(self, "_step_%s" % self.usage)(
+                in_token=in_token,
+                channel_bindings=channel_bindings,
+            )
+        except (struct.error, ValueError, KeyError, OverflowError) as e:
+            # A malformed token from the peer must surface as a library defined error and not leak the raw
+            # exceptions raised by the low level unpack functions.
+            raise InvalidTokenError(context_msg=f"Invalid NTLM message received from peer: {e}") from e
 
         if not self._is_wrapped:
             log.debug("NTLM step output: %s", base64.b64encode(out_token or b"").decode())

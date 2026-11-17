@@ -192,7 +192,7 @@ class NegotiateProxy(ContextProxy):
         if in_token:
             try:
                 in_token = unpack_token(in_token)
-            except struct.error as e:
+            except (struct.error, ValueError) as e:
                 raise InvalidTokenError(base_error=e, context_msg=f"Failed to unpack input token {e!s}")
 
             if isinstance(in_token, NegTokenInit):
@@ -216,6 +216,9 @@ class NegotiateProxy(ContextProxy):
                     # send it's own and uses the initiate mech list as the true mech list.
                     self._init_sent = True
                     self._mech_list = in_token.mech_types
+
+                    if not in_token.mech_types:
+                        raise InvalidTokenError(context_msg="NegTokenInit contained no mechTypes to negotiate")
 
                     # Windows rejects a supportedMech that does not echo the OID it offered, even when it is an alias
                     # of the same mech like the MS Kerberos OID. Reply with the first OID the initiator used for the
@@ -244,10 +247,16 @@ class NegotiateProxy(ContextProxy):
                 # If we have received the supported_mech then we don't need to send our own.
                 if in_token.supported_mech:
                     supported_mech = in_token.supported_mech
-                    self.__chosen_mech = next(
+                    chosen_mech = next(
                         (m for m in self._context_list if self._is_same_mech(m, supported_mech)),
-                        GSSMech.from_oid(supported_mech),
+                        None,
                     )
+                    if chosen_mech is None:
+                        raise InvalidTokenError(
+                            context_msg=f"Acceptor selected the unsupported mech {supported_mech}"
+                        )
+
+                    self.__chosen_mech = chosen_mech
                     self._mech_sent = True
 
                 # Raise exception if we are rejected and have no error info (mechToken) that will give us more info.

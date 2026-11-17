@@ -73,64 +73,69 @@ def unpack_token(
     Returns:
         any: The unpacked SPNEGO, Kerberos, or NTLM token.
     """
-    # First check if the message is an NTLM message.
-    if b_data.startswith(b"NTLMSSP\x00"):
-        if unwrap:
-            return NTLMMessage.unpack(b_data, encoding=encoding)
+    # This is a loop rather than recursion so that a token with many nested InitialContextToken values cannot
+    # exhaust the Python stack.
+    while True:
+        # First check if the message is an NTLM message.
+        if b_data.startswith(b"NTLMSSP\x00"):
+            if unwrap:
+                return NTLMMessage.unpack(b_data, encoding=encoding)
+
+            else:
+                return b_data
+
+        if mech and mech.is_kerberos_oid:
+            # A Kerberos value inside an InitialContextToken contains 2 bytes which we ignore.
+            raw_data = unpack_asn1(b_data[2:])[0]
+
+        else:
+            raw_data = unpack_asn1(b_data)[0]
+
+        if raw_data.tag_class == TagClass.application and mech and mech.is_kerberos_oid:
+            return KerberosV5Msg.unpack(unpack_asn1(raw_data.b_data)[0])
+
+        elif raw_data.tag_class == TagClass.application:
+            # The first token is encapsulated in an InitialContextToken.
+            if raw_data.tag_number != 0:
+                raise ValueError("Expecting a tag number of 0 not %s for InitialContextToken" % raw_data.tag_number)
+
+            initial_context_token = InitialContextToken.unpack(raw_data.b_data)
+
+            # unwrap=True is called from python -m spnego and we don't want to loose any info in the output.
+            if unwrap:
+                return initial_context_token
+
+            this_mech: typing.Optional[GSSMech]
+            try:
+                this_mech = GSSMech.from_oid(initial_context_token.this_mech)
+            except ValueError:
+                this_mech = None
+
+            # We currently only support SPNEGO, or raw Kerberos here.
+            if this_mech and (this_mech == GSSMech.spnego or (this_mech.is_kerberos_oid and unwrap)):
+                b_data = initial_context_token.inner_context_token
+                mech = this_mech
+                continue
+
+            return b_data
+
+        elif raw_data.tag_class == TagClass.context_specific:
+            # This is a raw NegotiationToken that is wrapped in a CHOICE or 0 or 1.
+            if raw_data.tag_number == 0:
+                return NegTokenInit.unpack(raw_data.b_data)
+
+            elif raw_data.tag_number == 1:
+                return NegTokenResp.unpack(raw_data.b_data)
+
+            else:
+                raise ValueError("Unknown NegotiationToken CHOICE %d, only expecting 0 or 1" % raw_data.tag_number)
+
+        elif unwrap:
+            # Could also be the ASN.1 Sequence of the Kerberos message.
+            return KerberosV5Msg.unpack(raw_data)
 
         else:
             return b_data
-
-    if mech and mech.is_kerberos_oid:
-        # A Kerberos value inside an InitialContextToken contains 2 bytes which we ignore.
-        raw_data = unpack_asn1(b_data[2:])[0]
-
-    else:
-        raw_data = unpack_asn1(b_data)[0]
-
-    if raw_data.tag_class == TagClass.application and mech and mech.is_kerberos_oid:
-        return KerberosV5Msg.unpack(unpack_asn1(raw_data.b_data)[0])
-
-    elif raw_data.tag_class == TagClass.application:
-        # The first token is encapsulated in an InitialContextToken.
-        if raw_data.tag_number != 0:
-            raise ValueError("Expecting a tag number of 0 not %s for InitialContextToken" % raw_data.tag_number)
-
-        initial_context_token = InitialContextToken.unpack(raw_data.b_data)
-
-        # unwrap=True is called from python -m spnego and we don't want to loose any info in the output.
-        if unwrap:
-            return initial_context_token
-
-        this_mech: typing.Optional[GSSMech]
-        try:
-            this_mech = GSSMech.from_oid(initial_context_token.this_mech)
-        except ValueError:
-            this_mech = None
-
-        # We currently only support SPNEGO, or raw Kerberos here.
-        if this_mech and (this_mech == GSSMech.spnego or (this_mech.is_kerberos_oid and unwrap)):
-            return unpack_token(initial_context_token.inner_context_token, mech=this_mech)
-
-        return b_data
-
-    elif raw_data.tag_class == TagClass.context_specific:
-        # This is a raw NegotiationToken that is wrapped in a CHOICE or 0 or 1.
-        if raw_data.tag_number == 0:
-            return NegTokenInit.unpack(raw_data.b_data)
-
-        elif raw_data.tag_number == 1:
-            return NegTokenResp.unpack(raw_data.b_data)
-
-        else:
-            raise ValueError("Unknown NegotiationToken CHOICE %d, only expecting 0 or 1" % raw_data.tag_number)
-
-    elif unwrap:
-        # Could also be the ASN.1 Sequence of the Kerberos message.
-        return KerberosV5Msg.unpack(raw_data)
-
-    else:
-        return b_data
 
 
 # https://www.rfc-editor.org/rfc/rfc4178.html#section-4.2.1 - ContextFlags
