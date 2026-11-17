@@ -589,6 +589,15 @@ class NTLMProxy(ContextProxy):
 
             if target_info.get(AvId.flags, 0) & AvFlags.mic:
                 expected_mic = auth.mic
+                if expected_mic is None or len(expected_mic) != 16:
+                    # The initiator declared a MIC in the AV pairs but the Authenticate message does not contain a
+                    # valid MIC slot. This is a protocol violation and could indicate a MITM tampering with the
+                    # payload offsets to bypass the MIC check so fail with a protocol error rather than silently
+                    # skipping the MIC verification.
+                    raise InvalidTokenError(
+                        context_msg="NTLM Authenticate message is missing the MIC but the initiator flags indicate "
+                        "one was provided"
+                    )
 
         else:
             if not self._nt_v1:

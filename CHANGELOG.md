@@ -2,6 +2,11 @@
 
 ## 0.13.0 - TBD
 
+* Fix NTLM acceptor skipping the MIC verification when the `AUTHENTICATE` message payload offsets were tampered with
+  * A MITM could rewrite a payload field as a zero length field pointing before the MIC slot, hiding the MIC from the acceptor and silently skipping the integrity check even though the initiator declared a MIC in the AV pairs
+  * The acceptor now rejects the message with an `InvalidTokenError` if the AV pairs declare a MIC but the message does not contain a valid 16 byte MIC slot
+  * The MIC slot is also validated against the actual message length so a truncated message is not treated as containing a MIC
+
 ## 0.12.4 - 2026-10-06
 
 * Fix SSPI acceptor with explicit `Password` or `KerberosKeytab` credentials failing with `SEC_E_LOGON_DENIED` when the username is in the UPN form `user@REALM`

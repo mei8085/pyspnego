@@ -874,6 +874,23 @@ def test_authenticate_set_mic_not_present():
         authenticate.mic = b"\x11" * 16
 
 
+def test_authenticate_mic_slot_out_of_bounds():
+    authenticate = messages.Authenticate(
+        flags=messages.NegotiateFlags.unicode | messages.NegotiateFlags.version,
+        version=messages.Version(6, 1, 7601),
+    )
+    b_data = bytearray(authenticate.pack())
+
+    # The payload offsets claim the payload starts after the Version and MIC slots but the message ends before
+    # the MIC slot is complete. The MIC must be reported as absent and not as a truncated value.
+    actual = messages.Authenticate.unpack(bytes(b_data[:72]))
+
+    assert actual.mic is None
+
+    with pytest.raises(ValueError, match="Cannot set MIC on an Authenticate message with no MIC present"):
+        actual.mic = b"\x11" * 16
+
+
 def test_authenticate_unpack_empty():
     actual = messages.Authenticate.unpack(
         b"\x4e\x54\x4c\x4d\x53\x53\x50\x00"

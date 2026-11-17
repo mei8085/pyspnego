@@ -678,14 +678,16 @@ class Authenticate(NTLMMessage):
     def _get_mic_offset(self) -> int:
         """Gets the offset of the MIC structure if present."""
         payload_offset = self._payload_offset
+        msg_length = len(self._data)
 
         # If the payload offset is 88 or more then we must have the Version (8 bytes) and the MIC (16 bytes) plus
-        # any random data after that.
-        if payload_offset >= 88:
+        # any random data after that. The MIC slot must also fit within the actual message, a truncated message
+        # that claims a larger payload offset does not contain a valid MIC.
+        if payload_offset >= 88 and msg_length >= 88:
             return 72
 
         # If the payload offset is between 80 and 88, then we should have just the MIC and no Version.
-        elif payload_offset >= 80:
+        elif payload_offset >= 80 and msg_length >= 80:
             return 64
 
         # Not enough room for a MIC between the minimum size and the payload offset.

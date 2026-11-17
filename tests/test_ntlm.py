@@ -513,6 +513,35 @@ def test_ntlm_bad_mic(ntlm_cred):
         s.step(auth.tobytes())
 
 
+def test_ntlm_mic_declared_but_slot_removed(ntlm_cred):
+    c = spnego.client(
+        ntlm_cred[0],
+        ntlm_cred[1],
+        hostname=socket.gethostname(),
+        options=spnego.NegotiateOptions.use_ntlm,
+        protocol="ntlm",
+    )
+    s = spnego.server(options=spnego.NegotiateOptions.use_ntlm, protocol="ntlm")
+
+    auth = c.step(s.step(c.step()))
+    assert auth is not None
+
+    # The genuine message declares a MIC in the AV pairs and contains the MIC slot.
+    assert Authenticate.unpack(auth).mic is not None
+
+    # A MITM rewrites the LmChallengeResponse payload field as a zero length field pointing at offset 64. This
+    # moves the computed payload offset before the MIC slot, hiding it from the acceptor. As the AV pairs still
+    # declare a MIC the acceptor must reject the message as a protocol error and not silently skip the MIC check.
+    tampered = bytearray(auth)
+    tampered[12:20] = b"\x00\x00\x00\x00\x40\x00\x00\x00"
+
+    with pytest.raises(
+        InvalidTokenError,
+        match="NTLM Authenticate message is missing the MIC but the initiator flags indicate one was provided",
+    ):
+        s.step(bytes(tampered))
+
+
 @pytest.mark.parametrize(
     "env_var, expected",
     [
